@@ -1,36 +1,31 @@
 // Package okx is the library behind the okx command line:
-// the HTTP client, request shaping, and the typed data models for okx.
+// the HTTP client, request shaping, and the typed data models for the
+// OKX crypto exchange public market data API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client paces requests, retries transient errors (429 and 5xx), and sets
+// an honest User-Agent. All four operations (ticker, tickers, candles,
+// instruments) read from OKX public endpoints that need no API key.
 package okx
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to okx. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "okx/dev (+https://github.com/tamnd/okx-cli)"
+// DefaultUserAgent identifies the client to OKX.
+const DefaultUserAgent = "okx-cli/0.1 (tamnd87@gmail.com)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at okx.com; change it once you
-// know the real endpoints you want to read.
-const Host = "okx.com"
+// Host is the OKX hostname this client talks to.
+const Host = "www.okx.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// BaseURL is the root every API request is built from.
+const BaseURL = "https://www.okx.com/api/v5"
 
-// Client talks to okx over HTTP.
+// Client talks to the OKX public API over HTTPS.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -41,20 +36,207 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: 15 * time.Second},
 		UserAgent: DefaultUserAgent,
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// wireResp is the OKX API envelope for all responses.
+type wireResp[T any] struct {
+	Code string `json:"code"`
+	Msg  string `json:"msg"`
+	Data []T    `json:"data"`
+}
+
+// Ticker holds current price and 24h stats for one instrument.
+type Ticker struct {
+	Symbol  string `kit:"id" json:"symbol"`
+	Last    string `json:"last"`
+	Bid     string `json:"bid"`
+	Ask     string `json:"ask"`
+	Open24h string `json:"open_24h"`
+	High24h string `json:"high_24h"`
+	Low24h  string `json:"low_24h"`
+	Vol24h  string `json:"vol_24h"`
+}
+
+// wireTicker is the raw OKX ticker shape from the API.
+type wireTicker struct {
+	InstID    string `json:"instId"`
+	Last      string `json:"last"`
+	AskPx     string `json:"askPx"`
+	BidPx     string `json:"bidPx"`
+	Open24h   string `json:"open24h"`
+	High24h   string `json:"high24h"`
+	Low24h    string `json:"low24h"`
+	Vol24h    string `json:"vol24h"`
+	VolCcy24h string `json:"volCcy24h"`
+}
+
+func toTicker(w wireTicker) *Ticker {
+	return &Ticker{
+		Symbol:  w.InstID,
+		Last:    w.Last,
+		Bid:     w.BidPx,
+		Ask:     w.AskPx,
+		Open24h: w.Open24h,
+		High24h: w.High24h,
+		Low24h:  w.Low24h,
+		Vol24h:  w.Vol24h,
+	}
+}
+
+// Candle is one OHLCV bar for an instrument.
+type Candle struct {
+	Timestamp string `kit:"id" json:"timestamp"`
+	Open      string `json:"open"`
+	High      string `json:"high"`
+	Low       string `json:"low"`
+	Close     string `json:"close"`
+	Volume    string `json:"volume"`
+}
+
+// Instrument is a trading pair listed on OKX.
+type Instrument struct {
+	ID       string `kit:"id" json:"id"`
+	Base     string `json:"base"`
+	Quote    string `json:"quote"`
+	MinSize  string `json:"min_size"`
+	TickSize string `json:"tick_size"`
+	State    string `json:"state"`
+}
+
+// wireInstrument is the raw OKX instrument shape from the API.
+type wireInstrument struct {
+	InstID  string `json:"instId"`
+	BaseCcy string `json:"baseCcy"`
+	QuoteCcy string `json:"quoteCcy"`
+	MinSz   string `json:"minSz"`
+	TickSz  string `json:"tickSz"`
+	State   string `json:"state"`
+}
+
+func toInstrument(w wireInstrument) *Instrument {
+	return &Instrument{
+		ID:       w.InstID,
+		Base:     w.BaseCcy,
+		Quote:    w.QuoteCcy,
+		MinSize:  w.MinSz,
+		TickSize: w.TickSz,
+		State:    w.State,
+	}
+}
+
+// GetTicker fetches the current price and 24h stats for one instrument (e.g. "BTC-USDT").
+func (c *Client) GetTicker(ctx context.Context, symbol string) (*Ticker, error) {
+	url := BaseURL + "/market/ticker?instId=" + symbol
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireResp[wireTicker]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("ticker decode: %w", err)
+	}
+	if len(resp.Data) == 0 {
+		return nil, fmt.Errorf("no ticker data for %s", symbol)
+	}
+	return toTicker(resp.Data[0]), nil
+}
+
+// GetTickers fetches all tickers for an instrument type (SPOT, SWAP, FUTURES, OPTION).
+// Results are capped at limit; pass 0 for no cap.
+func (c *Client) GetTickers(ctx context.Context, instType string, limit int) ([]*Ticker, error) {
+	url := BaseURL + "/market/tickers?instType=" + instType
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireResp[wireTicker]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("tickers decode: %w", err)
+	}
+	out := make([]*Ticker, 0, len(resp.Data))
+	for _, w := range resp.Data {
+		out = append(out, toTicker(w))
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// GetCandles fetches OHLCV candlestick bars for a symbol.
+// bar is one of 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W, 1M.
+// count is the number of bars; OKX max is 300.
+func (c *Client) GetCandles(ctx context.Context, symbol, bar string, count int) ([]*Candle, error) {
+	url := fmt.Sprintf("%s/market/candles?instId=%s&bar=%s&limit=%d", BaseURL, symbol, bar, count)
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	// candles: data is [][]json.RawMessage (array of arrays)
+	var resp struct {
+		Code string              `json:"code"`
+		Msg  string              `json:"msg"`
+		Data [][]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("candles decode: %w", err)
+	}
+	out := make([]*Candle, 0, len(resp.Data))
+	for _, row := range resp.Data {
+		if len(row) < 6 {
+			continue
+		}
+		var ts, open, high, low, close_, vol string
+		// each element is a quoted JSON string
+		_ = json.Unmarshal(row[0], &ts)
+		_ = json.Unmarshal(row[1], &open)
+		_ = json.Unmarshal(row[2], &high)
+		_ = json.Unmarshal(row[3], &low)
+		_ = json.Unmarshal(row[4], &close_)
+		_ = json.Unmarshal(row[5], &vol)
+		out = append(out, &Candle{
+			Timestamp: ts,
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     close_,
+			Volume:    vol,
+		})
+	}
+	return out, nil
+}
+
+// GetInstruments fetches the list of trading instruments for an instrument type.
+// Results are capped at limit; pass 0 for no cap.
+func (c *Client) GetInstruments(ctx context.Context, instType string, limit int) ([]*Instrument, error) {
+	url := BaseURL + "/public/instruments?instType=" + instType
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireResp[wireInstrument]
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("instruments decode: %w", err)
+	}
+	out := make([]*Instrument, 0, len(resp.Data))
+	for _, w := range resp.Data {
+		out = append(out, toInstrument(w))
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// Get fetches rawURL and returns the body. It paces and retries transient errors.
 func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -122,112 +304,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on okx.com. It is a stand-in for the typed records you
-// will model from the real okx endpoints.
-//
-// The kit struct tags make it addressable as a resource URI (see domain.go): ID
-// is the URI id, and Body is the long text `okx cat` and the Markdown
-// export print. The table tags shape the terminal grid (`-o table`) without
-// touching the JSON: URL is flagged the canonical column the `url` format prints,
-// and Body is hidden from the grid with `table:"-"` because a long preview wrecks
-// a row, though it still rides in `-o json` and `okx cat`. Swap `-` for
-// `table:"body,truncate"` if you would rather clip it to the terminal width.
-type Page struct {
-	ID    string `json:"id" kit:"id" table:"id"`
-	URL   string `json:"url" table:"url,url"`
-	Title string `json:"title,omitempty" table:"title"`
-	Body  string `json:"body,omitempty" kit:"body" table:"-"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-// Search fetches the site's search results for query and returns the matching
-// pages as stubs, the same shape PageLinks emits, so every hit is an addressable
-// okx.com page URI a host can follow. Like the rest of the scaffold it is a
-// stand-in: it reads the links out of a results page rather than a real search
-// API. Point it at the real endpoint and parse the real result shape once you
-// know it.
-func (c *Client) Search(ctx context.Context, query string, limit int) ([]*Page, error) {
-	body, err := c.Get(ctx, BaseURL+"/search?q="+url.QueryEscape(query))
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
